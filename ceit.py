@@ -10,7 +10,7 @@ import numpy as np
 #%%
 H = 256
 W = 256
-
+batch_size = 4
 transform = transforms.Compose([transforms.ToTensor(), 
                                 transforms.Resize((H, W)),
                                 transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
@@ -18,33 +18,44 @@ transform = transforms.Compose([transforms.ToTensor(),
 
 train_dataset_dir = 'c:/users/armin/desktop/animal'
 train_dataset = torchvision.datasets.ImageFolder(train_dataset_dir, transform=transform)
-train_data_loader = torch.utils.data.DataLoader(train_dataset, batch_size=4, shuffle=True, drop_last=True)
-#%%
-X = 3
-P = 16
-C = 3
-N = H*W/(P**2)
-S = 4
+train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 #%%
 def generate_pathes():
     pass
 
 class MSA(nn.Module):
-    def __init__ (self):
+    def __init__ (self, N=512, h=3):
         super().__init__()
-        self.q = nn.Linear(256,256)
-        self.k = nn.Linear(256,256)
-        self.v = nn.Linear(256,256)
+        self.n = N
+        self.h = h
+        self.q = nn.Linear(N,N)
+        self.k = nn.Linear(N,N)
+        self.v = nn.Linear(N,N)
+        self.mha = nn.Linear(1536,512)
+        self.LN = nn.LayerNorm([257, 512])
+        self.FF = nn.Linear(N,N)
     
     def forward(self, x):
         q = self.q(x)
         k = self.k(x)
         v = self.v(x)
         k = k.transpose(1,2)
-        scores = torch.matmul(q, k) / np.sqrt(256)
-        scores = F.softmax(scores, dim=-1)
-        output = torch.matmul(scores, v)
-        return output
+        for i in range(0,self.h):
+            scores = torch.matmul(q, k) / np.sqrt(self.n)
+            scores = F.softmax(scores, dim=-1)
+            current_output = torch.matmul(scores, v)
+            if i == 0:
+                output = current_output
+            else:
+                output = torch.cat((output, current_output), dim=2)
+        x_msa = self.mha(output)
+        x = x + x_msa
+        x = self.LN(x)  
+        x_ff = self.FF(x)
+        x = x + x_ff
+        x = self.LN(x)
+        # print(x.size());sys.exit()        
+        return x
     
 class FFN(nn.Module):
     def __init__ (self):
@@ -57,37 +68,35 @@ class FFN(nn.Module):
 class LeFF(nn.Module):
     def __init__ (self):
         super().__init__()
+        self.e = 4
         self.gelu = nn.GELU()
         self.BN = nn.BatchNorm1d(256)
         self.BN2 = nn.BatchNorm2d(16)
         self.conv2d = nn.Conv2d(16, 16, 1, stride=1)
-        self.to_h = nn.Linear(256,1024)
-        self.to_h2 = nn.Linear(1024,256)
-        
+        self.linear1 = nn.Linear(512,512*4)
+        self.linear2 = nn.Linear(512*4,512)
         
     def forward(self, x):
-        x = self.to_h(x)
-        
+        x = self.linear1(x)
         x = self.BN(x)
         x = self.gelu(x)
-        
-        x = x.view(4,16,16,1024)
+        x = x.view(4,16,16,2048)
         x = self.conv2d(x)
-        
         x = self.BN2(x)
         x = self.gelu(x)
-        
-        x = x.view(4,256,1024)
-        x = self.to_h2(x)
+        x = x.view(4,256,2048)
+        x = self.linear2(x)
+        x = self.BN(x)
+        x = self.gelu(x)
         return x
         
     
 class I2T(nn.Module):
-    def __init__ (self, input_channel=3, output_channel=256):
+    def __init__ (self):
         super().__init__()
-        self.conv2d = nn.Conv2d(input_channel, output_channel, 3, stride=4)
-        self.BN = nn.BatchNorm2d(output_channel)
-        self.MaxPool = nn.MaxPool2d(3, stride=4)
+        self.conv2d = nn.Conv2d(3, 32, 2, 2) #(3,enriched_channel,kernel,stride) page5
+        self.BN = nn.BatchNorm2d(32)
+        self.MaxPool = nn.MaxPool2d(1, 2) #(kernel,stride) page5
         
     def forward(self, x):
         x = self.conv2d(x)
@@ -98,92 +107,80 @@ class I2T(nn.Module):
 class FFN(nn.Module):
     def __init__ (self, input_channel=3, output_channel=256):
         super().__init__()
-        self.to_h1 = nn.Linear(256,256)
-        self.to_h2 = nn.Linear(256,256)
-        self.to_h3 = nn.Linear(256,2)
+        self.linear1 = nn.Linear(512,512, bias=True)
+        self.linear2 = nn.Linear(512,512, bias=True)
+        self.linear3 = nn.Linear(512,2, bias=True)
         self.gelu = nn.GELU()
         
     def forward(self, x):
-        x = self.to_h1(x)
+        x = self.linear1(x)
         x = self.gelu(x)
-        x = self.to_h2(x)
-        x = self.to_h3(x)
+        x = self.linear2(x)
+        x = self.linear3(x)
         return x
     
     
 class CeiT(nn.Module):
-    def __init__ (self, input_channel=3, output_channel=256):
+    def __init__ (self):
         super().__init__()
-        self.embeds = nn.Embedding(2, 1)
-        self.i2t = I2T(input_channel=3, output_channel=256)
-        self.position_embedding = torch.nn.parameter.Parameter(data=torch.rand(257,256), requires_grad=True)
-        self.msa = MSA()
+        # self.embeds = nn.Embedding(2, 1)
+        self.i2t = I2T()
+        self.position_embedding = torch.nn.parameter.Parameter(data=torch.rand(257,512), requires_grad=True)
+        self.msa = MSA(N=512)
         self.lef = LeFF()
         self.ffn = FFN()
+        
     def forward(self, x):
-        x = self.i2t(x)
-        
-        class_token = torch.randn(4, 1, 16, 16)
+        x = self.i2t(x); 
+        x = x.view(4,-1,32,4,4); 
+        class_token = torch.randn(4, 1, 32, 4, 4)
         x = torch.cat((x, class_token), dim=1)
-        
         x = x.view(4, 257, -1)
-        
-        x = x + self.position_embedding # 4,33,256
-        x = self.msa(x)
-        x_withoutclass = x[:,0,:]
-        x_withclass = x[:,1:,:]
-        x_withoutclass = x_withoutclass.unsqueeze(1)
-        # x_withclass = x_withclass.unsqueeze(1)
-        x = self.lef(x_withclass)
-        x = torch.cat((x, x_withoutclass), dim=1)
-        x  = self.ffn(x_withoutclass)
-        return x
-    
+        x = x + self.position_embedding
+        for i in range(0,12):
+            x = self.msa(x)  
+        x_split_class = x[:,0,:]
+        x_split_class = x_split_class.unsqueeze(1)
+        x_split_tokens = x[:,1:,:]
+        x = self.lef(x_split_tokens)
+        x = torch.cat((x, x_split_class), dim=1)
+        x  = self.ffn(x_split_class)
+        return x[:,0]
+
+
+X = 3
+P = 16 # patches size
+N = int(H*W/(P**2)) # number of patches
+input_img_stride = 4
+C = 0 # latent embeddings size
+maxpool_stride = 0
+MSA_h = 0 # number of heads in MSA
+MSA_N = 0
+i2t_kernel_size = 3
+i2t_stride = 3
+i2t_maxpool_stride = 3
+
 model = CeiT()
 model.train()
-smp = next(iter(train_data_loader))[0]
+smp = next(iter(train_dataloader))[0]
 
 vv = model(smp)
 
 #%%
 model.train()
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=0.05)
 loss_func = nn.CrossEntropyLoss()
 
 for epoch in range(2):
     total_loss = 0
-    for i, batch in enumerate(train_data_loader):
+    for i, batch in enumerate(train_dataloader):
         optimizer.zero_grad()
         output = model(batch[0])[:,0]
-        # print(output[:,0])
-        # print((batch[1].to(torch.float32)))2
-        # output = output.squeeze(1)
-        # print(output)
-        # output2 = torch.argmax(output,dim=1)
-        loss = loss_func(output, batch[1])
+        loss = loss_func(output, batch[1].to(torch.float32))
+        total_loss = loss.item() + total_loss
         print(loss)
-        # loss = loss_func(output.to(torch.float32), batch[1].to(torch.float32))
         loss.backward()
         optimizer.step()
-        if i==300: sys.exit()
-    #     src = batch[0].to(device)
-    #     src_mask = batch[1].to(device)
-    #     trg = batch[2].to(device)
-    #     trg_mask = batch[3].to(device)
-    #     optimizer.zero_grad()
-    #     preds = model(src, trg[:,:-1], src_mask, trg_mask[:,:-1])
-    #     ys = (trg[:,1:]).to(device)
-    #     ys = ys.contiguous().view(-1)
-    #     pred = preds.view(-1, preds.size(-1))
-    #     loss = loss_func(pred, ys)
-    #     loss.backward()
-    #     optimizer.step()
-    #     total_loss = loss.item() + total_loss
-    #     # if i == 100: sys.exit()
-    #     if (i % 500) == 0:
-    #         print(loss)
-    # total_loss_list.append(total_loss)
-    # print(total_loss)
+    pritn(total_loss)
+        # if i==10: sys.exit()
 #%%
-next(iter(train_data_loader))[1].size()
-output2.size()
